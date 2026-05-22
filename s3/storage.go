@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/syndtr/goleveldb/leveldb/storage"
@@ -107,6 +108,9 @@ type S3Storage struct {
 	mu       sync.Mutex
 	closed   bool
 	localDir string
+	pendingDir string // 本地目录，用于存储上传失败的文件，确保数据不丢失
+	retryStopCh chan struct{} // 后台重试停止信号
+	retryWg     sync.WaitGroup
 }
 
 func NewS3Storage(client S3ClientAPI, s3Lock *S3Lock, opt OpenOption) (*S3Storage, error) {
@@ -130,6 +134,16 @@ func NewS3Storage(client S3ClientAPI, s3Lock *S3Lock, opt OpenOption) (*S3Storag
 		}
 	}
 
+	// 初始化 pending upload 目录，用于上传失败时本地持久化
+	pendingDir := ""
+	if opt.EnableLocalPersistence {
+		pendingDir = opt.LocalPersistencePath()
+		if err := os.MkdirAll(pendingDir, 0755); err != nil {
+			cancel()
+			return nil, fmt.Errorf("failed to create pending upload dir: %w", err)
+		}
+	}
+
 	ss := &S3Storage{
 		client:   client,
 		s3Lock:   s3Lock,
@@ -138,6 +152,14 @@ func NewS3Storage(client S3ClientAPI, s3Lock *S3Lock, opt OpenOption) (*S3Storag
 		cancel:   cancel,
 		cache:    cache,
 		localDir: localDir,
+		pendingDir: pendingDir,
+		retryStopCh: make(chan struct{}),
+	}
+
+	// 启动后台重试 goroutine，无限重试直到成功
+	if pendingDir != "" {
+		ss.retryWg.Add(1)
+		go ss.backgroundRetryLoop()
 	}
 
 	return ss, nil
@@ -374,6 +396,18 @@ func (s *S3Storage) uploadFile(fd storage.FileDesc, data []byte) error {
 	s.Log(fmt.Sprintf("uploadFile start: %s (%d bytes)", name, len(data)))
 	if err := s.client.PutBytes(s.ctx, name, data); err != nil {
 		s.Log(fmt.Sprintf("uploadFile FAIL: %s (%v)", name, err))
+
+		// 上传失败时，尝试本地持久化以确保数据不丢失
+		if s.pendingDir != "" {
+			if persistErr := s.persistToLocal(fd, data); persistErr != nil {
+				s.Log(fmt.Sprintf("uploadFile: 本地持久化也失败: %s (%v)", name, persistErr))
+				return fmt.Errorf("failed to upload file %s: %w (local persist also failed: %v)", name, err, persistErr)
+			}
+			s.Log(fmt.Sprintf("uploadFile: S3上传失败但已本地持久化，后台将自动重试: %s", name))
+			// 本地持久化成功，数据已保存，后台 goroutine 会无限重试直到成功
+			return nil
+		}
+
 		return fmt.Errorf("failed to upload file %s: %w", name, err)
 	}
 
@@ -382,6 +416,108 @@ func (s *S3Storage) uploadFile(fd storage.FileDesc, data []byte) error {
 
 	s.Log(fmt.Sprintf("uploadFile OK: %s (%d bytes)", name, len(data)))
 	return nil
+}
+
+// persistToLocal 将数据写入本地 pending 目录，确保上传失败时数据不丢失
+func (s *S3Storage) persistToLocal(fd storage.FileDesc, data []byte) error {
+	if s.pendingDir == "" {
+		return errors.New("pending directory not configured")
+	}
+
+	name := fd.String()
+	localPath := filepath.Join(s.pendingDir, name)
+
+	// 确保目录存在
+	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+		return fmt.Errorf("failed to create local directory: %w", err)
+	}
+
+	// 写入本地文件
+	if err := os.WriteFile(localPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write local file: %w", err)
+	}
+
+	s.Log(fmt.Sprintf("persistToLocal OK: %s (%d bytes) -> %s", name, len(data), localPath))
+	return nil
+}
+
+// RetryPendingUploads 重试 pending 目录中积压的上传任务
+// 成功上传的文件会从 pending 目录删除
+// 返回成功和失败的数量
+func (s *S3Storage) RetryPendingUploads() (successCount, failCount int, err error) {
+	if s.pendingDir == "" || s.opt.LocalCacheDir == "" {
+		return 0, 0, nil
+	}
+
+	entries, err := os.ReadDir(s.pendingDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, 0, nil
+		}
+		return 0, 0, fmt.Errorf("failed to read pending dir: %w", err)
+	}
+
+	s.Log(fmt.Sprintf("RetryPendingUploads: 发现 %d 个待上传文件", len(entries)))
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		localPath := filepath.Join(s.pendingDir, name)
+
+		data, readErr := os.ReadFile(localPath)
+		if readErr != nil {
+			s.Log(fmt.Sprintf("RetryPendingUploads: 读取本地文件失败: %s (%v)", name, readErr))
+			failCount++
+			continue
+		}
+
+		fd, ok := parseFileDesc(name)
+		if !ok {
+			s.Log(fmt.Sprintf("RetryPendingUploads: 无法解析文件名: %s", name))
+			failCount++
+			continue
+		}
+
+		s.Log(fmt.Sprintf("RetryPendingUploads: 重试上传: %s (%d bytes)", name, len(data)))
+		uploadErr := s.client.PutBytes(s.ctx, fd.String(), data)
+		if uploadErr != nil {
+			s.Log(fmt.Sprintf("RetryPendingUploads: 上传失败: %s (%v)", name, uploadErr))
+			failCount++
+			continue
+		}
+
+		// 上传成功，删除本地文件
+		if rmErr := os.Remove(localPath); rmErr != nil {
+			s.Log(fmt.Sprintf("RetryPendingUploads: 删除本地文件失败: %s (%v)", name, rmErr))
+		}
+		successCount++
+		s.Log(fmt.Sprintf("RetryPendingUploads: 上传成功并删除本地文件: %s", name))
+	}
+
+	s.Log(fmt.Sprintf("RetryPendingUploads: 完成，成功=%d, 失败=%d", successCount, failCount))
+	return successCount, failCount, nil
+}
+
+// HasPendingUploads 检查是否有待上传的文件
+func (s *S3Storage) HasPendingUploads() bool {
+	if s.pendingDir == "" {
+		return false
+	}
+
+	entries, err := os.ReadDir(s.pendingDir)
+	if err != nil {
+		return false
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *S3Storage) Remove(fd storage.FileDesc) error {
@@ -454,6 +590,146 @@ func (s *S3Storage) Rename(oldfd, newfd storage.FileDesc) error {
 	return nil
 }
 
+// backgroundRetryLoop 后台 goroutine，持续监控并重试 pending 目录中的文件
+// 直到成功或收到停止信号
+func (s *S3Storage) backgroundRetryLoop() {
+	defer s.retryWg.Done()
+
+	flushInterval := s.opt.RetryFlushInterval
+	if flushInterval <= 0 {
+		flushInterval = 5 * time.Second
+	}
+
+	s.Log(fmt.Sprintf("backgroundRetryLoop: 启动后台重试循环，间隔=%v", flushInterval))
+
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.retryStopCh:
+			s.Log("backgroundRetryLoop: 收到停止信号，正在等待当前重试完成...")
+			// 再做一次最终重试，确保所有文件都被尝试
+			s.retryPendingFilesOnce()
+			s.Log("backgroundRetryLoop: 已停止")
+			return
+		case <-ticker.C:
+			s.retryPendingFilesOnce()
+		}
+	}
+}
+
+// retryPendingFilesOnce 单次尝试重试所有 pending 文件
+func (s *S3Storage) retryPendingFilesOnce() {
+	if s.pendingDir == "" {
+		return
+	}
+
+	entries, err := os.ReadDir(s.pendingDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			s.Log(fmt.Sprintf("retryPendingFilesOnce: 读取pending目录失败: %v", err))
+		}
+		return
+	}
+
+	if len(entries) == 0 {
+		return
+	}
+
+	s.Log(fmt.Sprintf("retryPendingFilesOnce: 发现 %d 个待上传文件", len(entries)))
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		localPath := filepath.Join(s.pendingDir, name)
+
+		data, readErr := os.ReadFile(localPath)
+		if readErr != nil {
+			s.Log(fmt.Sprintf("retryPendingFilesOnce: 读取本地文件失败: %s (%v)", name, readErr))
+			continue
+		}
+
+		fd, ok := parseFileDesc(name)
+		if !ok {
+			s.Log(fmt.Sprintf("retryPendingFilesOnce: 无法解析文件名: %s", name))
+			continue
+		}
+
+		s.Log(fmt.Sprintf("retryPendingFilesOnce: 尝试上传: %s (%d bytes)", name, len(data)))
+
+		// 带重试的 PutBytes
+		uploadErr := s.uploadWithInfiniteRetry(fd, data)
+		if uploadErr != nil {
+			s.Log(fmt.Sprintf("retryPendingFilesOnce: 上传失败（已达最大重试时间）: %s (%v)", name, uploadErr))
+			continue
+		}
+
+		// 上传成功，删除本地文件
+		if rmErr := os.Remove(localPath); rmErr != nil {
+			s.Log(fmt.Sprintf("retryPendingFilesOnce: 删除本地文件失败: %s (%v)", name, rmErr))
+		} else {
+			s.Log(fmt.Sprintf("retryPendingFilesOnce: 上传成功并删除本地文件: %s", name))
+		}
+	}
+}
+
+// uploadWithInfiniteRetry 无限重试直到成功
+// 如果配置了 RetryMaxDuration，则在超过该时间后返回错误
+func (s *S3Storage) uploadWithInfiniteRetry(fd storage.FileDesc, data []byte) error {
+	name := fd.String()
+	maxDuration := s.opt.RetryMaxDuration
+	baseDelay := s.opt.RetryBaseDelay
+	retryMaxAttempts := s.opt.RetryMaxAttempts
+
+	startTime := time.Now()
+	attempt := 0
+
+	for {
+		select {
+		case <-s.retryStopCh:
+			return errors.New("收到停止信号")
+		default:
+		}
+
+		// 检查是否超过最大重试时间
+		if maxDuration > 0 && time.Since(startTime) > maxDuration {
+			return fmt.Errorf("超过最大重试持续时间 %v", maxDuration)
+		}
+
+		attempt++
+		err := s.client.PutBytes(s.ctx, name, data)
+		if err == nil {
+			s.Log(fmt.Sprintf("uploadWithInfiniteRetry: 第%d次尝试成功: %s", attempt, name))
+			return nil
+		}
+
+		s.Log(fmt.Sprintf("uploadWithInfiniteRetry: 第%d次尝试失败: %s (%v)", attempt, name, err))
+
+		// 使用指数退避，但限制最大延迟为 30 秒
+		delay := baseDelay * time.Duration(1<<uint(attempt))
+		if delay > 30*time.Second {
+			delay = 30 * time.Second
+		}
+
+		// 如果配置了最大重试次数，超过后按最大延迟继续重试
+		if retryMaxAttempts > 0 && attempt >= retryMaxAttempts {
+			delay = 30 * time.Second
+		}
+
+		s.Log(fmt.Sprintf("uploadWithInfiniteRetry: 等待 %v 后重试: %s", delay, name))
+
+		select {
+		case <-s.retryStopCh:
+			return errors.New("收到停止信号")
+		case <-time.After(delay):
+		}
+	}
+}
+
 func (s *S3Storage) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -465,6 +741,10 @@ func (s *S3Storage) Close() error {
 	s.closed = true
 
 	s.cache.Purge()
+
+	// 停止后台重试 goroutine
+	close(s.retryStopCh)
+	s.retryWg.Wait()
 
 	s.cancel()
 
