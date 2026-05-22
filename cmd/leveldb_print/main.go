@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/qiukeren/levels3/internal/s3"
+	"github.com/qiukeren/levels3/s3"
 
 	"github.com/syndtr/goleveldb/leveldb"
 	lvldberrors "github.com/syndtr/goleveldb/leveldb/errors"
