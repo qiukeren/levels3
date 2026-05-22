@@ -1,4 +1,4 @@
-module levels3
+module github.com/qiukeren/levels3
 
 go 1.24
 
