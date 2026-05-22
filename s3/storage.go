@@ -538,6 +538,15 @@ func (s *S3Storage) Remove(fd storage.FileDesc) error {
 		os.Remove(localPath)
 	}
 
+	// 同时删除 pending 目录中的文件，避免后台继续上传已删除的文件
+	if s.pendingDir != "" {
+		pendingPath := filepath.Join(s.pendingDir, name)
+		rmErr := os.Remove(pendingPath)
+		if rmErr == nil {
+			s.Log(fmt.Sprintf("Remove: 同时删除 pending 目录中的文件: %s", name))
+		}
+	}
+
 	if err := s.client.Remove(s.ctx, name); err != nil {
 		return fmt.Errorf("failed to remove file %s: %w", name, err)
 	}
@@ -570,6 +579,29 @@ func (s *S3Storage) Rename(oldfd, newfd storage.FileDesc) error {
 		s.cache.Add(newCacheKey, &memFile{fd: newfd, data: oldData})
 	} else {
 		s.Log(fmt.Sprintf("Rename: cache update skipped (GetBytes err: %v)", err))
+	}
+
+	// 处理 pending 目录中的文件：如果旧文件在 pending 目录中，需要重命名为新文件名
+	if s.pendingDir != "" {
+		oldPendingPath := filepath.Join(s.pendingDir, oldName)
+		newPendingPath := filepath.Join(s.pendingDir, newName)
+
+		// 检查旧文件是否存在
+		if _, statErr := os.Stat(oldPendingPath); statErr == nil {
+			// 旧文件存在，重命名为新文件名
+			if renameErr := os.Rename(oldPendingPath, newPendingPath); renameErr == nil {
+				s.Log(fmt.Sprintf("Rename: 同时重命名 pending 目录中的文件: %s -> %s", oldName, newName))
+			} else {
+				s.Log(fmt.Sprintf("Rename: 重命名 pending 目录文件失败: %s (%v)", oldName, renameErr))
+				// 如果重命名失败，尝试读取后写入新文件再删除旧文件
+				if data, readErr := os.ReadFile(oldPendingPath); readErr == nil {
+					if writeErr := os.WriteFile(newPendingPath, data, 0644); writeErr == nil {
+						os.Remove(oldPendingPath)
+						s.Log(fmt.Sprintf("Rename: 通过读写方式重命名 pending 目录文件成功: %s -> %s", oldName, newName))
+					}
+				}
+			}
+		}
 	}
 
 	if err := s.client.Remove(s.ctx, oldName); err != nil {
