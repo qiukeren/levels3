@@ -304,9 +304,37 @@ func (s *S3Storage) List(ft storage.FileType) ([]storage.FileDesc, error) {
 		return nil, fmt.Errorf("failed to list files: %w", err)
 	}
 
+	// 同时收集 pending 目录中的文件
+	var pendingFiles []storage.FileDesc
+	if s.pendingDir != "" {
+		entries, readErr := os.ReadDir(s.pendingDir)
+		if readErr == nil {
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					if fd, ok := parseFileDesc(entry.Name()); ok {
+						pendingFiles = append(pendingFiles, fd)
+					}
+				}
+			}
+		}
+	}
+
+	// 合并两个列表，但去重（以 S3 中的为准）
+	seen := make(map[string]bool)
 	var filtered []storage.FileDesc
+
 	for _, fd := range allFiles {
+		key := fd.String()
+		seen[key] = true
 		if fd.Type&ft != 0 {
+			filtered = append(filtered, fd)
+		}
+	}
+
+	// 添加 pending 目录中但 S3 里没有的文件
+	for _, fd := range pendingFiles {
+		key := fd.String()
+		if !seen[key] && fd.Type&ft != 0 {
 			filtered = append(filtered, fd)
 		}
 	}
@@ -330,21 +358,33 @@ func (s *S3Storage) Open(fd storage.FileDesc) (storage.Reader, error) {
 		return &memReader{Reader: reader}, nil
 	}
 
+	// 1. 先尝试从 S3 读取
 	data, err := s.client.GetBytes(s.ctx, name)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) || isNotFoundError(err) {
-			return nil, os.ErrNotExist
+	if err == nil {
+		if len(data) <= int(s.opt.MaxFileSize) {
+			memFile := &memFile{fd: fd, data: data}
+			s.cache.Add(cacheKey, memFile)
 		}
-		return nil, fmt.Errorf("failed to open file %s: %w", name, err)
+		reader := bytes.NewReader(data)
+		return &memReader{Reader: reader}, nil
 	}
 
-	if len(data) <= int(s.opt.MaxFileSize) {
-		memFile := &memFile{fd: fd, data: data}
-		s.cache.Add(cacheKey, memFile)
+	// 2. S3 没找到，尝试从 pending 目录读取
+	if s.pendingDir != "" {
+		localPath := filepath.Join(s.pendingDir, name)
+		if localData, readErr := os.ReadFile(localPath); readErr == nil {
+			s.Log(fmt.Sprintf("Open: 从 pending 目录读取文件: %s", name))
+			// 不需要加入 cache，因为后台正在上传，等上传成功后再处理
+			reader := bytes.NewReader(localData)
+			return &memReader{Reader: reader}, nil
+		}
 	}
 
-	reader := bytes.NewReader(data)
-	return &memReader{Reader: reader}, nil
+	// 3. 都没找到，返回错误
+	if errors.Is(err, os.ErrNotExist) || isNotFoundError(err) {
+		return nil, os.ErrNotExist
+	}
+	return nil, fmt.Errorf("failed to open file %s: %w", name, err)
 }
 
 func (s *S3Storage) Create(fd storage.FileDesc) (storage.Writer, error) {
