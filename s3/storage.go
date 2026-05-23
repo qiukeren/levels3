@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -56,7 +57,7 @@ func (w *memWriter) Write(p []byte) (int, error) {
 	// a new manifest, updates CURRENT, deletes the old manifest, but never Sync()s
 	// the new manifest writer — leaving the new manifest only in memory buffer.
 	if w.localPath != "" {
-		if werr := os.WriteFile(w.localPath, w.buf.Bytes(), 0644); werr != nil {
+		if werr := atomicWriteFile(w.localPath, w.buf.Bytes(), 0644); werr != nil {
 			w.logFn(fmt.Sprintf("eager local cache write failed: %v", werr))
 		}
 	}
@@ -89,6 +90,14 @@ type storageLocker struct {
 }
 
 func (l *storageLocker) Unlock() {
+	// If the lock was already lost (lease expired, taken by another process),
+	// do NOT attempt to release the remote lock — it no longer belongs to us.
+	// Releasing it would delete the other process's lock, causing split-brain.
+	if l.s.lockLost.Load() {
+		l.s.Log("storageLocker.Unlock: lock already lost, skipping remote lock release")
+		return
+	}
+
 	if err := l.s.s3Lock.Unlock(l.s.ctx); err != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), l.s.opt.RequestTimeout)
 		defer cancel()
@@ -99,18 +108,19 @@ func (l *storageLocker) Unlock() {
 }
 
 type S3Storage struct {
-	client   S3ClientAPI
-	s3Lock   *S3Lock
-	opt      OpenOption
-	ctx      context.Context
-	cancel   context.CancelFunc
-	cache    *lru.Cache[string, *memFile]
-	mu       sync.Mutex
-	closed   bool
-	localDir string
-	pendingDir string // 本地目录，用于存储上传失败的文件，确保数据不丢失
+	client      S3ClientAPI
+	s3Lock      *S3Lock
+	opt         OpenOption
+	ctx         context.Context
+	cancel      context.CancelFunc
+	cache       *lru.Cache[string, *memFile]
+	mu          sync.Mutex
+	closed      bool
+	localDir    string
+	pendingDir  string        // 本地目录，用于存储上传失败的文件，确保数据不丢失
 	retryStopCh chan struct{} // 后台重试停止信号
 	retryWg     sync.WaitGroup
+	lockLost    atomic.Bool // 锁丢失标记，设置后禁止写入
 }
 
 func NewS3Storage(client S3ClientAPI, s3Lock *S3Lock, opt OpenOption) (*S3Storage, error) {
@@ -145,14 +155,14 @@ func NewS3Storage(client S3ClientAPI, s3Lock *S3Lock, opt OpenOption) (*S3Storag
 	}
 
 	ss := &S3Storage{
-		client:   client,
-		s3Lock:   s3Lock,
-		opt:      opt,
-		ctx:      ctx,
-		cancel:   cancel,
-		cache:    cache,
-		localDir: localDir,
-		pendingDir: pendingDir,
+		client:      client,
+		s3Lock:      s3Lock,
+		opt:         opt,
+		ctx:         ctx,
+		cancel:      cancel,
+		cache:       cache,
+		localDir:    localDir,
+		pendingDir:  pendingDir,
 		retryStopCh: make(chan struct{}),
 	}
 
@@ -177,6 +187,11 @@ func (s *S3Storage) Lock() (storage.Locker, error) {
 		return nil, fmt.Errorf("failed to acquire lock: %w", err)
 	}
 
+	// 优先恢复上一个崩溃 session 中未上传的 pending 文件
+	if err := s.syncPendingToS3(); err != nil {
+		s.Log(fmt.Sprintf("syncPendingToS3 had errors (continuing): %v", err))
+	}
+
 	if err := s.syncLocalToS3(); err != nil {
 		if unlockErr := s.s3Lock.Unlock(s.ctx); unlockErr != nil {
 			s.Log(fmt.Sprintf("failed to unlock after sync error: %v", unlockErr))
@@ -191,6 +206,9 @@ func (s *S3Storage) Lock() (storage.Locker, error) {
 	if err := s.cleanupOrphaned(); err != nil {
 		s.Log(fmt.Sprintf("failed to cleanup orphaned files: %v", err))
 	}
+
+	// 启动锁租约监控，锁丢失时自动禁用写入防止 split-brain
+	s.startLeaseMonitoring()
 
 	return &storageLocker{s: s}, nil
 }
@@ -214,6 +232,9 @@ func (s *S3Storage) SetMeta(fd storage.FileDesc) error {
 
 	if s.closed {
 		return storage.ErrClosed
+	}
+	if s.lockLost.Load() {
+		return ErrLockLost
 	}
 
 	key := "CURRENT"
@@ -319,11 +340,12 @@ func (s *S3Storage) List(ft storage.FileType) ([]storage.FileDesc, error) {
 		}
 	}
 
-	// 合并两个列表，但去重（以 S3 中的为准）
+	// 合并两个列表，去重时优先使用 pendingDir 版本（pendingDir 中的数据可能是更新版本）
 	seen := make(map[string]bool)
 	var filtered []storage.FileDesc
 
-	for _, fd := range allFiles {
+	// 先加 pendingDir 文件（优先级更高）
+	for _, fd := range pendingFiles {
 		key := fd.String()
 		seen[key] = true
 		if fd.Type&ft != 0 {
@@ -331,8 +353,8 @@ func (s *S3Storage) List(ft storage.FileType) ([]storage.FileDesc, error) {
 		}
 	}
 
-	// 添加 pending 目录中但 S3 里没有的文件
-	for _, fd := range pendingFiles {
+	// 再加 S3 中没有的文件
+	for _, fd := range allFiles {
 		key := fd.String()
 		if !seen[key] && fd.Type&ft != 0 {
 			filtered = append(filtered, fd)
@@ -394,6 +416,9 @@ func (s *S3Storage) Create(fd storage.FileDesc) (storage.Writer, error) {
 	if s.closed {
 		return nil, storage.ErrClosed
 	}
+	if s.lockLost.Load() {
+		return nil, ErrLockLost
+	}
 
 	name := fd.String()
 	buf := &bytes.Buffer{}
@@ -417,7 +442,7 @@ func (s *S3Storage) Create(fd storage.FileDesc) (storage.Writer, error) {
 		}
 		writer.localPath = localPath
 		writer.syncFn = func() error {
-			if err := os.WriteFile(localPath, buf.Bytes(), 0644); err != nil {
+			if err := atomicWriteFile(localPath, buf.Bytes(), 0644); err != nil {
 				return fmt.Errorf("failed to write local cache: %w", err)
 			}
 			return s.uploadFile(fd, buf.Bytes())
@@ -432,23 +457,33 @@ func (s *S3Storage) uploadFile(fd storage.FileDesc, data []byte) error {
 	if !isMetadataKey(name) && int64(len(data)) > s.opt.MaxFileSize {
 		return ErrFileTooLarge
 	}
+	if s.lockLost.Load() {
+		return ErrLockLost
+	}
 
 	s.Log(fmt.Sprintf("uploadFile start: %s (%d bytes)", name, len(data)))
 	if err := s.client.PutBytes(s.ctx, name, data); err != nil {
 		s.Log(fmt.Sprintf("uploadFile FAIL: %s (%v)", name, err))
 
-		// 上传失败时，尝试本地持久化以确保数据不丢失
+		// 上传失败时尝试本地持久化作为 crash-recovery safety net
 		if s.pendingDir != "" {
 			if persistErr := s.persistToLocal(fd, data); persistErr != nil {
 				s.Log(fmt.Sprintf("uploadFile: 本地持久化也失败: %s (%v)", name, persistErr))
-				return fmt.Errorf("failed to upload file %s: %w (local persist also failed: %v)", name, err, persistErr)
+			} else {
+				s.Log(fmt.Sprintf("uploadFile: S3上传失败但已本地持久化，数据可在重启后恢复: %s", name))
 			}
-			s.Log(fmt.Sprintf("uploadFile: S3上传失败但已本地持久化，后台将自动重试: %s", name))
-			// 本地持久化成功，数据已保存，后台 goroutine 会无限重试直到成功
-			return nil
 		}
 
+		// 返回真实 S3 错误，让 LevelDB 知道写入未提交
 		return fmt.Errorf("failed to upload file %s: %w", name, err)
+	}
+
+	// 上传成功，清理 pending 目录中可能存在的旧文件
+	if s.pendingDir != "" {
+		pendingPath := filepath.Join(s.pendingDir, name)
+		if rmErr := os.Remove(pendingPath); rmErr == nil {
+			s.Log(fmt.Sprintf("uploadFile: 清理 pending 目录中的旧文件: %s", name))
+		}
 	}
 
 	cacheKey := s.makeCacheKey(fd)
@@ -472,8 +507,8 @@ func (s *S3Storage) persistToLocal(fd storage.FileDesc, data []byte) error {
 		return fmt.Errorf("failed to create local directory: %w", err)
 	}
 
-	// 写入本地文件
-	if err := os.WriteFile(localPath, data, 0644); err != nil {
+	// 原子写入本地文件（先写临时文件再重命名，防止崩溃产生截断文件）
+	if err := atomicWriteFile(localPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write local file: %w", err)
 	}
 
@@ -567,6 +602,9 @@ func (s *S3Storage) Remove(fd storage.FileDesc) error {
 	if s.closed {
 		return storage.ErrClosed
 	}
+	if s.lockLost.Load() {
+		return ErrLockLost
+	}
 
 	name := fd.String()
 	cacheKey := s.makeCacheKey(fd)
@@ -600,6 +638,9 @@ func (s *S3Storage) Rename(oldfd, newfd storage.FileDesc) error {
 
 	if s.closed {
 		return storage.ErrClosed
+	}
+	if s.lockLost.Load() {
+		return ErrLockLost
 	}
 
 	oldName := oldfd.String()
@@ -696,6 +737,10 @@ func (s *S3Storage) retryPendingFilesOnce() {
 	if s.pendingDir == "" {
 		return
 	}
+	if s.lockLost.Load() {
+		s.Log("retryPendingFilesOnce: lock lost, skipping retry")
+		return
+	}
 
 	entries, err := os.ReadDir(s.pendingDir)
 	if err != nil {
@@ -767,6 +812,10 @@ func (s *S3Storage) uploadWithInfiniteRetry(fd storage.FileDesc, data []byte) er
 		default:
 		}
 
+		if s.lockLost.Load() {
+			return ErrLockLost
+		}
+
 		// 检查是否超过最大重试时间
 		if maxDuration > 0 && time.Since(startTime) > maxDuration {
 			return fmt.Errorf("超过最大重试持续时间 %v", maxDuration)
@@ -831,6 +880,27 @@ func (s *S3Storage) Log(str string) {
 	fmt.Printf("[S3Storage] %s\n", str)
 }
 
+// startLeaseMonitoring starts a background goroutine that watches the
+// S3Lock.LeaseErr() channel. If the lease is lost (network partition,
+// lock expiry), it sets the lockLost flag, causing all subsequent
+// mutating operations to return ErrLockLost. This provides fencing:
+// once the lease is lost, this process stops writing, preventing
+// split-brain corruption.
+func (s *S3Storage) startLeaseMonitoring() {
+	go func() {
+		select {
+		case err, ok := <-s.s3Lock.LeaseErr():
+			if !ok {
+				return // channel closed, lock already released
+			}
+			s.Log(fmt.Sprintf("CRITICAL: lost distributed lock: %v. Disabling writes.", err))
+			s.lockLost.Store(true)
+		case <-s.ctx.Done():
+			return
+		}
+	}()
+}
+
 func (s *S3Storage) syncLocalToS3() error {
 	if s.localDir == "" {
 		return nil
@@ -871,6 +941,80 @@ func (s *S3Storage) syncLocalToS3() error {
 	}
 
 	return nil
+}
+
+// syncPendingToS3 attempts to upload all files from pendingDir to S3.
+// This is called during Lock() to recover data that was persisted locally
+// when S3 uploads failed in a previous (crashed) session.
+//
+// Design: best-effort. If some files cannot be uploaded (e.g., S3 is still
+// unreachable), LevelDB can still open -- pending files stay in pendingDir
+// for the next attempt via backgroundRetryLoop.
+func (s *S3Storage) syncPendingToS3() error {
+	if s.pendingDir == "" {
+		return nil
+	}
+
+	entries, err := os.ReadDir(s.pendingDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to read pending dir: %w", err)
+	}
+
+	if len(entries) == 0 {
+		return nil
+	}
+
+	s.Log(fmt.Sprintf("syncPendingToS3: found %d pending files to recover", len(entries)))
+	var firstErr error
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		localPath := filepath.Join(s.pendingDir, name)
+
+		data, readErr := os.ReadFile(localPath)
+		if readErr != nil {
+			s.Log(fmt.Sprintf("syncPendingToS3: failed to read %s: %v", name, readErr))
+			continue
+		}
+
+		fd, ok := parseFileDesc(name)
+		if !ok {
+			s.Log(fmt.Sprintf("syncPendingToS3: unrecognized filename %s, removing", name))
+			os.Remove(localPath)
+			continue
+		}
+
+		s.Log(fmt.Sprintf("syncPendingToS3: recovering %s (%d bytes)", name, len(data)))
+		if err := s.client.PutBytes(s.ctx, name, data); err != nil {
+			s.Log(fmt.Sprintf("syncPendingToS3: FAILED to upload %s: %v (keeping in pendingDir)", name, err))
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue // best-effort: keep trying other files
+		}
+
+		// Upload successful -- remove from pendingDir
+		if rmErr := os.Remove(localPath); rmErr != nil {
+			s.Log(fmt.Sprintf("syncPendingToS3: uploaded %s but failed to remove local copy: %v", name, rmErr))
+		} else {
+			s.Log(fmt.Sprintf("syncPendingToS3: successfully recovered %s", name))
+		}
+
+		// Update in-memory cache
+		cacheKey := s.makeCacheKey(fd)
+		if len(data) <= int(s.opt.MaxFileSize) {
+			s.cache.Add(cacheKey, &memFile{fd: fd, data: data})
+		}
+	}
+
+	return firstErr
 }
 
 // cleanupOrphaned checks for inconsistent state in S3 and tries to recover.
@@ -942,7 +1086,22 @@ func (s *S3Storage) verifyCurrentManifest() error {
 		}
 	}
 
-	// Could not recover from local cache
+	// Check pendingDir for the manifest before giving up
+	if s.pendingDir != "" {
+		pendingPath := filepath.Join(s.pendingDir, fd.String())
+		if pData, pErr := os.ReadFile(pendingPath); pErr == nil && len(pData) > 0 {
+			s.Log(fmt.Sprintf("cleanup: found %s in pendingDir (%d bytes), uploading to S3", fd.String(), len(pData)))
+			if err := s.client.PutBytes(s.ctx, fd.String(), pData); err != nil {
+				s.Log(fmt.Sprintf("cleanup: failed to upload recovered manifest from pendingDir: %v", err))
+			} else {
+				s.Log(fmt.Sprintf("cleanup: successfully recovered %s from pendingDir", fd.String()))
+				os.Remove(pendingPath)
+				return nil
+			}
+		}
+	}
+
+	// Could not recover from local cache or pendingDir
 	s.Log(fmt.Sprintf("cleanup: removing all orphaned files (manifest %s unrecoverable)", fd.String()))
 	return s.removeAllOrphaned()
 }
@@ -983,6 +1142,28 @@ func (s *S3Storage) recoverFromLocalCache() error {
 			}
 
 			s.Log(fmt.Sprintf("cleanup: successfully recovered database from local cache (CURRENT → %s)", manifestFd.String()))
+			return nil
+		}
+	}
+
+	// Try to find MANIFEST in pendingDir before giving up
+	if s.pendingDir != "" {
+		manifestFd, manifestData, pErr := s.findLatestPendingManifest()
+		if pErr == nil && manifestFd != nil && len(manifestData) > 0 {
+			s.Log(fmt.Sprintf("cleanup: recovering manifest %s from pendingDir (%d bytes)", manifestFd.String(), len(manifestData)))
+			if err := s.client.PutBytes(s.ctx, manifestFd.String(), manifestData); err != nil {
+				s.Log(fmt.Sprintf("cleanup: failed to upload recovered manifest from pendingDir: %v", err))
+				return s.removeAllOrphaned()
+			}
+
+			currentContent := manifestFd.String() + "\n"
+			if err := s.client.PutBytes(s.ctx, "CURRENT", []byte(currentContent)); err != nil {
+				s.Log(fmt.Sprintf("cleanup: failed to write recovered CURRENT: %v", err))
+				return s.removeAllOrphaned()
+			}
+
+			s.Log(fmt.Sprintf("cleanup: successfully recovered database from pendingDir (CURRENT &rarr; %s)", manifestFd.String()))
+			os.Remove(filepath.Join(s.pendingDir, manifestFd.String()))
 			return nil
 		}
 	}
@@ -1032,6 +1213,42 @@ func (s *S3Storage) findLatestLocalManifest() (fd *storage.FileDesc, data []byte
 	return &storage.FileDesc{Type: storage.TypeManifest, Num: bestNum}, fileData, nil
 }
 
+// findLatestPendingManifest scans the pendingDir for MANIFEST files and returns
+// the one with the highest file number. This is used during crash recovery to
+// find manifest files that were persisted locally but not yet uploaded to S3.
+func (s *S3Storage) findLatestPendingManifest() (fd *storage.FileDesc, data []byte, err error) {
+	if s.pendingDir == "" {
+		return nil, nil, os.ErrNotExist
+	}
+	entries, err := os.ReadDir(s.pendingDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	var bestNum int64
+	var bestName string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		var num int
+		if n, _ := fmt.Sscanf(name, "MANIFEST-%d", &num); n == 1 {
+			if int64(num) > bestNum {
+				bestNum = int64(num)
+				bestName = name
+			}
+		}
+	}
+	if bestName == "" {
+		return nil, nil, fmt.Errorf("no MANIFEST file found in pending dir")
+	}
+	fileData, err := os.ReadFile(filepath.Join(s.pendingDir, bestName))
+	if err != nil {
+		return nil, nil, err
+	}
+	return &storage.FileDesc{Type: storage.TypeManifest, Num: bestNum}, fileData, nil
+}
+
 // removeAllOrphaned removes all LevelDB files from S3 and purges local cache,
 // so that LevelDB can start fresh on the next Open().
 // This is a last resort when auto-recovery from local cache fails.
@@ -1075,6 +1292,36 @@ func (s *S3Storage) removeAllOrphaned() error {
 
 func (s *S3Storage) makeCacheKey(fd storage.FileDesc) string {
 	return fd.String()
+}
+
+// atomicWriteFile writes data to a temp file in the same directory, then renames
+// it atomically. This prevents partial/corrupted files if the process crashes
+// mid-write, ensuring the file is either the old complete version or the new one.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmpFile, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("write temp: %w", err)
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("close temp: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("rename: %w", err)
+	}
+
+	return nil
 }
 
 func (s *S3Storage) shouldCacheLocally(fd storage.FileDesc) bool {

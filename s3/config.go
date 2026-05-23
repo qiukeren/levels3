@@ -9,12 +9,12 @@ import (
 
 const (
 	DefaultMaxCacheSize   = 500
-	DefaultMaxFileSize    = 64 * 1024 * 1024 // 64MB
-	DefaultRetryAttempts  = 5                // 增加重试次数
+	DefaultMaxFileSize    = 64 * 1024 * 1024       // 64MB
+	DefaultRetryAttempts  = 5                      // 增加重试次数
 	DefaultRetryBaseDelay = 500 * time.Millisecond // 增加基础延迟，更适合网络抖动
-	DefaultRequestTimeout = 120 * time.Second // 增加单次请求超时
-	DefaultLeaseDuration  = 60 * time.Second // 增加锁的 Lease 时间
-	DefaultLeaseRenewal   = 20 * time.Second // 增加续约间隔
+	DefaultRequestTimeout = 120 * time.Second      // 增加单次请求超时
+	DefaultLeaseDuration  = 60 * time.Second       // 增加锁的 Lease 时间
+	DefaultLeaseRenewal   = 20 * time.Second       // 增加续约间隔
 	// RetryMaxDuration 无限重试的最大持续时间，0 表示无限重试直到成功
 	DefaultRetryMaxDuration = 0
 	// RetryFlushInterval 后台重试的检查间隔

@@ -208,6 +208,16 @@ func randomInt() int {
 	return int(n.Int64())
 }
 
+// isProcessRunning checks whether a process with the given PID is still running.
+//
+// WARNING: On Unix, os.FindProcess always succeeds and Signal(nil) returns nil
+// for any valid PID, even if it belongs to a different (recycled) process.
+// This means a stale lock from a dead process could be interpreted as still held
+// if another process reuses the same PID.
+//
+// This is a secondary check; the primary defense against stale locks is the
+// lease timestamp expiration in isLockStale(). The PID check serves only as
+// an optimization to quickly identify locks held by definitely-dead processes.
 func isProcessRunning(pid int) bool {
 	process, err := os.FindProcess(pid)
 	if err != nil {

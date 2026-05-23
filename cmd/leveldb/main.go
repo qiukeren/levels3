@@ -31,7 +31,7 @@ func main() {
 		}
 		if i%100000 == 0 {
 			elapsed := time.Since(batchStart)
-			log.Printf("Written %d/%d keys (%.2f%%), elapsed: %v", 
+			log.Printf("Written %d/%d keys (%.2f%%), elapsed: %v",
 				i, totalKeys, float64(i)/float64(totalKeys)*100, elapsed)
 			batchStart = time.Now()
 		}
@@ -49,6 +49,6 @@ func main() {
 	}
 
 	totalElapsed := time.Since(startTime)
-	log.Printf("Done! Total keys: %d, total time: %v, avg: %v/key", 
+	log.Printf("Done! Total keys: %d, total time: %v, avg: %v/key",
 		count, totalElapsed, totalElapsed/time.Duration(totalKeys))
 }

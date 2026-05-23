@@ -1,6 +1,6 @@
 // Package s3 provides an S3-backed storage backend for LevelDB.
 //
-// Architecture
+// # Architecture
 //
 // The package is organized into seven files with clear separation of concerns:
 //

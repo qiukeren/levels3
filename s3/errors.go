@@ -10,6 +10,7 @@ var (
 	ErrInvalidFile       = errors.New("invalid file descriptor")
 	ErrClosed            = errors.New("storage is closed")
 	ErrRetryExhausted    = errors.New("max retry attempts exhausted")
+	ErrLockLost          = errors.New("distributed lock lost: writes are no longer safe")
 )
 
 type RetryableError struct {
