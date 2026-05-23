@@ -79,8 +79,18 @@ func (l *S3Lock) Lock(ctx context.Context) error {
 
 // Unlock releases the distributed lock. It stops the lease renewal goroutine,
 // deletes the remote lock file, and removes the local lock file.
+//
+// This method is idempotent: calling it multiple times is safe. The stopCh
+// close is protected by a select+default check to prevent panic on double-close.
 func (l *S3Lock) Unlock(ctx context.Context) error {
-	close(l.stopCh)
+	// Safely close stopCh without panicking on second call.
+	// This happens when storageLocker.Unlock or S3Storage.Unlock retries on failure.
+	select {
+	case <-l.stopCh:
+		// Already closed
+	default:
+		close(l.stopCh)
+	}
 
 	if err := l.releaseRemoteLock(ctx); err != nil {
 		return fmt.Errorf("failed to release remote lock: %w", err)

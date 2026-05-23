@@ -121,6 +121,7 @@ type S3Storage struct {
 	retryStopCh chan struct{} // 后台重试停止信号
 	retryWg     sync.WaitGroup
 	lockLost    atomic.Bool // 锁丢失标记，设置后禁止写入
+	lockHeld    atomic.Bool // 是否持有分布式锁，后台重试前检查
 }
 
 func NewS3Storage(client S3ClientAPI, s3Lock *S3Lock, opt OpenOption) (*S3Storage, error) {
@@ -187,6 +188,10 @@ func (s *S3Storage) Lock() (storage.Locker, error) {
 		return nil, fmt.Errorf("failed to acquire lock: %w", err)
 	}
 
+	// 锁刚获取立即启动租约监控，确保在后继 recovery 操作期间
+	// 如果 lease renewal 失败能立即检测到并禁止写入，防止 split-brain
+	s.startLeaseMonitoring()
+
 	// 优先恢复上一个崩溃 session 中未上传的 pending 文件
 	if err := s.syncPendingToS3(); err != nil {
 		s.Log(fmt.Sprintf("syncPendingToS3 had errors (continuing): %v", err))
@@ -207,8 +212,7 @@ func (s *S3Storage) Lock() (storage.Locker, error) {
 		s.Log(fmt.Sprintf("failed to cleanup orphaned files: %v", err))
 	}
 
-	// 启动锁租约监控，锁丢失时自动禁用写入防止 split-brain
-	s.startLeaseMonitoring()
+	s.lockHeld.Store(true)
 
 	return &storageLocker{s: s}, nil
 }
@@ -217,7 +221,18 @@ func (s *S3Storage) Unlock() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.lockHeld.Store(false)
+
+	// 如果锁已丢失（租约过期、被其他进程抢占），不释放远程锁
+	// 释放远程锁会删除对方的锁，导致 split-brain
+	if s.lockLost.Load() {
+		s.Log("S3Storage.Unlock: lock already lost, skipping remote lock release")
+		return
+	}
+
 	if err := s.s3Lock.Unlock(s.ctx); err != nil {
+		// 如果第一次解锁失败（网络问题），s3Lock.Unlock 已标记 stopCh 关闭
+		// 重试解锁是安全的（s3Lock.Unlock 现在是幂等的）
 		ctx, cancel := context.WithTimeout(context.Background(), s.opt.RequestTimeout)
 		defer cancel()
 		if err2 := s.s3Lock.Unlock(ctx); err2 != nil {
@@ -686,8 +701,15 @@ func (s *S3Storage) Rename(oldfd, newfd storage.FileDesc) error {
 	}
 
 	if err := s.client.Remove(s.ctx, oldName); err != nil {
-		s.Log(fmt.Sprintf("Rename FAIL (Remove source): %s (%v)", oldName, err))
-		return fmt.Errorf("failed to delete source %s after copy: %w", oldName, err)
+		s.Log(fmt.Sprintf("Rename WARN (Remove source): %s (%v), retrying with timeout", oldName, err))
+		// 网络超时可能导致 Remove 失败，重试一次防止新旧文件同时在 S3 中
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), s.opt.RequestTimeout)
+		defer retryCancel()
+		if retryErr := s.client.Remove(retryCtx, oldName); retryErr != nil {
+			s.Log(fmt.Sprintf("Rename FAIL (Remove source retry): %s (%v)", oldName, retryErr))
+			return fmt.Errorf("failed to delete source %s after copy (retried): %w", oldName, retryErr)
+		}
+		s.Log(fmt.Sprintf("Rename: Remove retry succeeded: %s", oldName))
 	}
 
 	if s.shouldCacheLocally(oldfd) {
@@ -739,6 +761,12 @@ func (s *S3Storage) retryPendingFilesOnce() {
 	}
 	if s.lockLost.Load() {
 		s.Log("retryPendingFilesOnce: lock lost, skipping retry")
+		return
+	}
+	if !s.lockHeld.Load() {
+		// 未持有分布式锁时不应该上传文件到 S3，防止与其他进程产生 split-brain
+		// 当 Lock() 被调用后会设置 lockHeld = true，后台重试才能安全上传
+		s.Log("retryPendingFilesOnce: lock not held, skipping retry")
 		return
 	}
 
@@ -863,11 +891,11 @@ func (s *S3Storage) Close() error {
 
 	s.cache.Purge()
 
-	// 停止后台重试 goroutine
+	// 先取消全局 context，中断正在进行的 S3 请求（如 PutBytes）
+	// 再等待后台 goroutine 退出，避免在 PutBytes 超时期间阻塞 120 秒
+	s.cancel()
 	close(s.retryStopCh)
 	s.retryWg.Wait()
-
-	s.cancel()
 
 	return nil
 }
@@ -1252,7 +1280,15 @@ func (s *S3Storage) findLatestPendingManifest() (fd *storage.FileDesc, data []by
 // removeAllOrphaned removes all LevelDB files from S3 and purges local cache,
 // so that LevelDB can start fresh on the next Open().
 // This is a last resort when auto-recovery from local cache fails.
+//
+// IMPORTANT: This function must NEVER be called when the lock is not held.
+// It unconditionally deletes all S3 data for this path.
 func (s *S3Storage) removeAllOrphaned() error {
+	if s.lockLost.Load() {
+		s.Log("removeAllOrphaned: lock lost, skipping S3 cleanup to avoid data loss")
+		return ErrLockLost
+	}
+
 	// Purge in-memory cache
 	s.cache.Purge()
 
