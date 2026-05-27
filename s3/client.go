@@ -346,6 +346,46 @@ func (c *S3Client) Copy(ctx context.Context, srcKey, dstKey string) error {
 	return err
 }
 
+// ListNames implements S3ClientAPI.ListNames.
+// Lists all S3 objects under opt.Path/prefix and returns relative keys with the prefix included.
+func (c *S3Client) ListNames(ctx context.Context, prefix string) ([]string, error) {
+	ctx, cancel := c.operationContext(ctx)
+	defer cancel()
+
+	var names []string
+	fullPrefix := c.pathPrefix() + prefix
+	start := time.Now()
+	c.debug("ListNames start: prefix=%q", prefix)
+
+	err := c.retry(ctx, func() error {
+		names = nil
+		paginator := s3.NewListObjectsV2Paginator(c.client, &s3.ListObjectsV2Input{
+			Bucket: aws.String(c.opt.Bucket),
+			Prefix: aws.String(fullPrefix),
+		})
+		for paginator.HasMorePages() {
+			page, err := paginator.NextPage(ctx)
+			if err != nil {
+				return &RetryableError{Err: err}
+			}
+			for _, obj := range page.Contents {
+				relKey := strings.TrimPrefix(*obj.Key, c.pathPrefix())
+				if relKey != "" && *obj.Key != c.pathPrefix() {
+					names = append(names, relKey)
+				}
+			}
+		}
+		return nil
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		c.debug("ListNames FAIL: prefix=%q (%v, elapsed=%v)", prefix, err, elapsed)
+		return nil, fmt.Errorf("failed to list names with prefix %q: %w", prefix, err)
+	}
+	c.debug("ListNames OK: prefix=%q, %d objects (elapsed=%v)", prefix, len(names), elapsed)
+	return names, nil
+}
+
 // retry runs fn with WithRetry using the configured max attempts and base delay.
 func (c *S3Client) retry(ctx context.Context, fn func() error) error {
 	return WithRetry(ctx, c.opt.RetryMaxAttempts, c.opt.RetryBaseDelay, fn)

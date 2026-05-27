@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/syndtr/goleveldb/leveldb/storage"
 )
@@ -15,6 +17,7 @@ type mockClient struct {
 	// Configure behavior
 	putBytesFunc       func(ctx context.Context, key string, data []byte) error
 	listFunc           func(ctx context.Context) ([]storage.FileDesc, error)
+	listNamesFunc      func(ctx context.Context, prefix string) ([]string, error)
 	existsFunc         func(ctx context.Context, key string) (bool, error)
 	getBytesFunc       func(ctx context.Context, key string) ([]byte, error)
 	removeFunc         func(ctx context.Context, key string) error
@@ -22,10 +25,8 @@ type mockClient struct {
 	putIfNotExistsFunc func(ctx context.Context, key string, data []byte) (bool, error)
 
 	// Record calls
-	putBytesCalls []struct {
-		Key  string
-		Data []byte
-	}
+	putBytesCalls  []struct{ Key string; Data []byte }
+	listNamesCalls []struct{ Prefix string }
 }
 
 func (m *mockClient) PutBytes(ctx context.Context, key string, data []byte) error {
@@ -70,6 +71,14 @@ func (m *mockClient) Exists(ctx context.Context, key string) (bool, error) {
 func (m *mockClient) List(ctx context.Context) ([]storage.FileDesc, error) {
 	if m.listFunc != nil {
 		return m.listFunc(ctx)
+	}
+	return nil, nil
+}
+
+func (m *mockClient) ListNames(ctx context.Context, prefix string) ([]string, error) {
+	m.listNamesCalls = append(m.listNamesCalls, struct{ Prefix string }{prefix})
+	if m.listNamesFunc != nil {
+		return m.listNamesFunc(ctx, prefix)
 	}
 	return nil, nil
 }
@@ -526,5 +535,580 @@ func TestCleanupRecoversManifestFromPendingDirWhenCurrentMissing(t *testing.T) {
 	// Verify pendingDir file was removed
 	if _, statErr := os.Stat(manifestPath); statErr == nil {
 		t.Fatal("expected " + manifestName + " to be removed from pendingDir after recovery")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GetMeta 错误路径测试
+// ---------------------------------------------------------------------------
+
+// TestGetMetaWhenExistsFails verifies that GetMeta propagates errors from
+// Exists("CURRENT") rather than silently returning os.ErrNotExist.
+func TestGetMetaWhenExistsFails(t *testing.T) {
+	s, _, cleanup := newTestStorage(t, func(m *mockClient) {
+		m.existsFunc = func(ctx context.Context, key string) (bool, error) {
+			if key == "CURRENT" {
+				return false, errors.New("s3 internal error")
+			}
+			return false, nil
+		}
+	})
+	defer cleanup()
+
+	_, err := s.GetMeta()
+	if err == nil || !strings.Contains(err.Error(), "CURRENT existence") {
+		t.Fatalf("expected error about CURRENT existence check, got: %v", err)
+	}
+}
+
+// TestGetMetaWhenGetBytesFails verifies that GetMeta propagates errors from
+// GetBytes("CURRENT") when the key is known to exist.
+func TestGetMetaWhenGetBytesFails(t *testing.T) {
+	s, _, cleanup := newTestStorage(t, func(m *mockClient) {
+		m.existsFunc = func(ctx context.Context, key string) (bool, error) {
+			return true, nil
+		}
+		m.getBytesFunc = func(ctx context.Context, key string) ([]byte, error) {
+			if key == "CURRENT" {
+				return nil, errors.New("s3 unavailable")
+			}
+			return nil, os.ErrNotExist
+		}
+	})
+	defer cleanup()
+
+	_, err := s.GetMeta()
+	if err == nil || !strings.Contains(err.Error(), "failed to get meta") {
+		t.Fatalf("expected error about getting meta content, got: %v", err)
+	}
+}
+
+// TestGetMetaWhenCurrentContentInvalid verifies that GetMeta returns an error
+// when CURRENT contains unparseable content.
+func TestGetMetaWhenCurrentContentInvalid(t *testing.T) {
+	s, _, cleanup := newTestStorage(t, func(m *mockClient) {
+		m.existsFunc = func(ctx context.Context, key string) (bool, error) {
+			return true, nil
+		}
+		m.getBytesFunc = func(ctx context.Context, key string) ([]byte, error) {
+			if key == "CURRENT" {
+				return []byte("not-a-valid-fd\n"), nil
+			}
+			return nil, os.ErrNotExist
+		}
+	})
+	defer cleanup()
+
+	_, err := s.GetMeta()
+	if err == nil || !strings.Contains(err.Error(), "invalid CURRENT") {
+		t.Fatalf("expected error about invalid CURRENT content, got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Open 非 NotFound 错误路径测试
+// ---------------------------------------------------------------------------
+
+// TestOpenWhenS3ReturnsNonNotFoundError verifies that Open returns a wrapped
+// error when S3 returns a non-NotFound error, rather than silently falling
+// through to os.ErrNotExist.
+func TestOpenWhenS3ReturnsNonNotFoundError(t *testing.T) {
+	s, _, cleanup := newTestStorage(t, func(m *mockClient) {
+		m.getBytesFunc = func(ctx context.Context, key string) ([]byte, error) {
+			return nil, errors.New("network timeout")
+		}
+	})
+	defer cleanup()
+
+	fd := storage.FileDesc{Type: storage.TypeTable, Num: 1}
+	_, err := s.Open(fd)
+	if err == nil {
+		t.Fatal("expected error when S3 returns non-NotFound error")
+	}
+	if strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected non-NotFound error, got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Rename pending 目录文件路径测试
+// ---------------------------------------------------------------------------
+
+// TestRenameWithPendingDirFiles verifies that Rename renames pending directory
+// files along with their .cksum companions when the old file exists in pendingDir.
+func TestRenameWithPendingDirFiles(t *testing.T) {
+	s, _, cleanup := newTestStorage(t, func(m *mockClient) {
+		m.copyFunc = func(ctx context.Context, srcKey, dstKey string) error {
+			return nil
+		}
+		m.removeFunc = func(ctx context.Context, key string) error {
+			return nil
+		}
+	})
+	defer cleanup()
+
+	oldName := "000001.ldb"
+	newName := "000002.ldb"
+
+	// Write old file and checksum to pendingDir
+	os.WriteFile(filepath.Join(s.pendingDir, oldName), []byte("pending-data"), 0644)
+	os.WriteFile(filepath.Join(s.pendingDir, oldName+".cksum"), []byte("abcdef01"), 0644)
+
+	oldfd := storage.FileDesc{Type: storage.TypeTable, Num: 1}
+	newfd := storage.FileDesc{Type: storage.TypeTable, Num: 2}
+
+	err := s.Rename(oldfd, newfd)
+	if err != nil {
+		t.Fatalf("Rename failed: %v", err)
+	}
+
+	// Verify pending file was renamed
+	if _, err := os.Stat(filepath.Join(s.pendingDir, newName)); err != nil {
+		t.Fatal("expected new pending file to exist after rename")
+	}
+	if _, err := os.Stat(filepath.Join(s.pendingDir, oldName)); !os.IsNotExist(err) {
+		t.Fatal("expected old pending file to be removed after rename")
+	}
+}
+
+// TestRenameWithPendingDirCopyFallback verifies that when os.Rename fails,
+// Rename falls back to copy-then-delete for pending directory files.
+func TestRenameWithPendingDirCopyFallback(t *testing.T) {
+	s, _, cleanup := newTestStorage(t, func(m *mockClient) {
+		m.copyFunc = func(ctx context.Context, srcKey, dstKey string) error {
+			return nil
+		}
+		m.removeFunc = func(ctx context.Context, key string) error {
+			return nil
+		}
+	})
+	defer cleanup()
+
+	oldName := "000003.ldb"
+	newName := "000004.ldb"
+	oldPendingPath := filepath.Join(s.pendingDir, oldName)
+	oldCksumPath := oldPendingPath + ".cksum"
+
+	// Write old file to pendingDir
+	os.WriteFile(oldPendingPath, []byte("pending-data"), 0644)
+	os.WriteFile(oldCksumPath, []byte("abcdef01"), 0644)
+
+	oldfd := storage.FileDesc{Type: storage.TypeTable, Num: 3}
+	newfd := storage.FileDesc{Type: storage.TypeTable, Num: 4}
+
+	err := s.Rename(oldfd, newfd)
+	if err != nil {
+		t.Fatalf("Rename failed: %v", err)
+	}
+
+	// Verify old file was removed and new file exists (via copy fallback)
+	if _, err := os.Stat(filepath.Join(s.pendingDir, newName)); err != nil {
+		t.Fatal("expected new pending file to exist after rename via copy fallback")
+	}
+	if _, err := os.Stat(oldPendingPath); !os.IsNotExist(err) {
+		t.Fatal("expected old pending file to be removed after copy fallback")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// uploadWithInfiniteRetry 锁丢失 / 超时测试
+// ---------------------------------------------------------------------------
+
+// TestUploadWithInfiniteRetryLockLost verifies that uploadWithInfiniteRetry
+// returns ErrLockLost when the lock is lost during retry.
+func TestUploadWithInfiniteRetryLockLost(t *testing.T) {
+	s, _, cleanup := newTestStorage(t, func(m *mockClient) {
+		m.putBytesFunc = func(ctx context.Context, key string, data []byte) error {
+			return errors.New("upload always fails")
+		}
+	})
+	defer cleanup()
+
+	// Fast retry config
+	s.opt.RetryMaxAttempts = 0
+	s.opt.RetryBaseDelay = 1 * time.Millisecond
+	s.opt.RetryMaxDuration = 0
+
+	fd := storage.FileDesc{Type: storage.TypeTable, Num: 1}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.uploadWithInfiniteRetry(fd, []byte("test data"))
+	}()
+
+	// Allow a few retry cycles to start
+	time.Sleep(50 * time.Millisecond)
+
+	// Simulate lock loss during retry
+	s.lockLost.Store(true)
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrLockLost) {
+			t.Fatalf("expected ErrLockLost, got: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for uploadWithInfiniteRetry to detect lockLost")
+	}
+}
+
+// TestUploadWithInfiniteRetryMaxDuration verifies that uploadWithInfiniteRetry
+// returns an error when RetryMaxDuration is exceeded.
+func TestUploadWithInfiniteRetryMaxDuration(t *testing.T) {
+	s, _, cleanup := newTestStorage(t, func(m *mockClient) {
+		m.putBytesFunc = func(ctx context.Context, key string, data []byte) error {
+			return errors.New("upload always fails")
+		}
+	})
+	defer cleanup()
+
+	s.opt.RetryMaxAttempts = 0
+	s.opt.RetryBaseDelay = 1 * time.Millisecond
+	s.opt.RetryMaxDuration = 100 * time.Millisecond
+
+	fd := storage.FileDesc{Type: storage.TypeTable, Num: 1}
+	err := s.uploadWithInfiniteRetry(fd, []byte("test"))
+
+	if err == nil {
+		t.Fatal("expected error when max retry duration exceeded, got nil")
+	}
+	if errors.Is(err, ErrLockLost) {
+		t.Fatal("expected max duration error, not ErrLockLost")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// syncLocalToS3 错误路径测试
+// ---------------------------------------------------------------------------
+
+// TestSyncLocalToS3WithPutBytesError verifies that syncLocalToS3 returns an
+// error when PutBytes fails for a local cache file.
+func TestSyncLocalToS3WithPutBytesError(t *testing.T) {
+	s, _, cleanup := newTestStorage(t, func(m *mockClient) {
+		m.putBytesFunc = func(ctx context.Context, key string, data []byte) error {
+			return errors.New("s3 upload failed")
+		}
+	})
+	defer cleanup()
+
+	// Write local cache files — LOCK and CURRENT are skipped by syncLocalToS3
+	os.WriteFile(filepath.Join(s.localDir, "000001.log"), []byte("journal data"), 0644)
+
+	err := s.syncLocalToS3()
+	if err == nil || !strings.Contains(err.Error(), "failed to sync") {
+		t.Fatalf("expected error about sync failure, got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// findLatestLocalManifest 测试
+// ---------------------------------------------------------------------------
+
+// TestFindLatestLocalManifest verifies that findLatestLocalManifest returns
+// the MANIFEST with the highest file number from the local cache directory.
+func TestFindLatestLocalManifest(t *testing.T) {
+	s, _, cleanup := newTestStorage(t, nil)
+	defer cleanup()
+
+	// Write manifest files with different numbers
+	os.WriteFile(filepath.Join(s.localDir, "MANIFEST-000001"), []byte("manifest1"), 0644)
+	os.WriteFile(filepath.Join(s.localDir, "MANIFEST-000003"), []byte("manifest3"), 0644)
+	os.WriteFile(filepath.Join(s.localDir, "000001.ldb"), []byte("noise"), 0644) // non-manifest
+
+	fd, data, err := s.findLatestLocalManifest()
+	if err != nil {
+		t.Fatalf("findLatestLocalManifest failed: %v", err)
+	}
+	if fd.Num != 3 {
+		t.Fatalf("expected manifest num 3, got %d", fd.Num)
+	}
+	if string(data) != "manifest3" {
+		t.Fatalf("expected manifest3 data, got %q", string(data))
+	}
+}
+
+// TestFindLatestLocalManifestNotFound verifies that findLatestLocalManifest
+// returns an error when no MANIFEST file exists in the local cache.
+func TestFindLatestLocalManifestNotFound(t *testing.T) {
+	s, _, cleanup := newTestStorage(t, nil)
+	defer cleanup()
+
+	// Only non-manifest files
+	os.WriteFile(filepath.Join(s.localDir, "000001.ldb"), []byte("data"), 0644)
+	os.WriteFile(filepath.Join(s.localDir, "000002.log"), []byte("journal"), 0644)
+
+	_, _, err := s.findLatestLocalManifest()
+	if err == nil {
+		t.Fatal("expected error when no MANIFEST found in local cache, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// removeAllOrphaned S3 清理路径测试
+// ---------------------------------------------------------------------------
+
+// TestRemoveAllOrphanedCleansS3 verifies that removeAllOrphaned removes all
+// LevelDB files from S3 including CURRENT.
+func TestRemoveAllOrphanedCleansS3(t *testing.T) {
+	var removedFiles []string
+	s, _, cleanup := newTestStorage(t, func(m *mockClient) {
+		m.listFunc = func(ctx context.Context) ([]storage.FileDesc, error) {
+			return []storage.FileDesc{
+				{Type: storage.TypeTable, Num: 1},
+				{Type: storage.TypeJournal, Num: 2},
+			}, nil
+		}
+		m.removeFunc = func(ctx context.Context, key string) error {
+			removedFiles = append(removedFiles, key)
+			return nil
+		}
+	})
+	defer cleanup()
+
+	err := s.removeAllOrphaned()
+	if err != nil {
+		t.Fatalf("removeAllOrphaned failed: %v", err)
+	}
+
+	// Should remove 000001.ldb, 000002.log, CURRENT
+	expectedRemoves := []string{"000001.ldb", "000002.log", "CURRENT"}
+	for _, expected := range expectedRemoves {
+		found := false
+		for _, removed := range removedFiles {
+			if removed == expected {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected %s to be removed, got removals: %v", expected, removedFiles)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Lock() 失败路径测试
+// ---------------------------------------------------------------------------
+
+// TestLockFailsWhenS3LockFails verifies that Lock() returns a wrapped error
+// when s3Lock.Lock() fails (e.g., network error while checking remote lock).
+func TestLockFailsWhenS3LockFails(t *testing.T) {
+	s, _, cleanup := newTestStorage(t, func(m *mockClient) {
+		m.existsFunc = func(ctx context.Context, key string) (bool, error) {
+			if key == "LOCK" {
+				return false, errors.New("network error checking LOCK")
+			}
+			return false, nil
+		}
+	})
+	defer cleanup()
+
+	_, err := s.Lock()
+	if err == nil || !strings.Contains(err.Error(), "failed to acquire lock") {
+		t.Fatalf("expected Lock() to fail with 'failed to acquire lock', got: %v", err)
+	}
+}
+
+// TestLockFailsWhenSyncLocalToS3Fails verifies that Lock() returns an error
+// when syncLocalToS3 fails, and properly releases the S3 lock before returning.
+func TestLockFailsWhenSyncLocalToS3Fails(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "levels3-lock-syncfail-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	var removeCalled bool
+	mock := &mockClient{
+		existsFunc: func(ctx context.Context, key string) (bool, error) {
+			return false, nil
+		},
+		putBytesFunc: func(ctx context.Context, key string, data []byte) error {
+			// Only allow LOCK to succeed; fail syncLocalToS3 uploads
+			if key == "LOCK" {
+				return nil
+			}
+			return errors.New("s3 upload failed")
+		},
+		listFunc: func(ctx context.Context) ([]storage.FileDesc, error) {
+			return nil, nil
+		},
+		removeFunc: func(ctx context.Context, key string) error {
+			removeCalled = true
+			return nil
+		},
+	}
+
+	opt := OpenOption{
+		Bucket:                 "test-bucket",
+		Path:                   "test-path",
+		Ak:                     "test-ak",
+		Sk:                     "test-sk",
+		Region:                 "us-east-1",
+		LocalCacheDir:          tmpDir,
+		EnableLocalPersistence: true,
+	}
+	opt.ApplyDefaults()
+
+	lock := NewS3Lock(mock, opt)
+	s, err := NewS3Storage(mock, lock, opt)
+	if err != nil {
+		t.Fatalf("NewS3Storage failed: %v", err)
+	}
+	defer s.Close()
+
+	// Write a local cache file so syncLocalToS3 has work to do
+	os.WriteFile(filepath.Join(s.localDir, "000001.log"), []byte("journal data"), 0644)
+
+	_, err = s.Lock()
+	if err == nil || !strings.Contains(err.Error(), "failed to sync local cache") {
+		t.Fatalf("expected Lock() to fail with sync error, got: %v", err)
+	}
+
+	if !removeCalled {
+		t.Fatal("expected s3Lock.Unlock to be called after syncLocalToS3 failure")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// S3Storage.Unlock 锁丢失路径测试
+// ---------------------------------------------------------------------------
+
+// TestS3StorageUnlockWithLockLost verifies that S3Storage.Unlock() skips
+// remote lock release when lockLost is true.
+func TestS3StorageUnlockWithLockLost(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "levels3-unlock-locklost-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	removeCount := 0
+	mock := &mockClient{
+		listFunc: func(ctx context.Context) ([]storage.FileDesc, error) {
+			return nil, nil
+		},
+		removeFunc: func(ctx context.Context, key string) error {
+			removeCount++
+			return nil
+		},
+	}
+
+	opt := OpenOption{
+		Bucket:        "test-bucket",
+		Path:          "test-path",
+		Ak:            "test-ak",
+		Sk:            "test-sk",
+		Region:        "us-east-1",
+		LocalCacheDir: tmpDir,
+	}
+	opt.ApplyDefaults()
+
+	lock := NewS3Lock(mock, opt)
+	s, err := NewS3Storage(mock, lock, opt)
+	if err != nil {
+		t.Fatalf("NewS3Storage failed: %v", err)
+	}
+	defer s.Close()
+
+	// Simulate lock held + lock lost
+	s.lockHeld.Store(true)
+	s.lockLost.Store(true)
+
+	s.Unlock()
+
+	if removeCount != 0 {
+		t.Fatalf("expected 0 Remove calls when Unlock with lockLost, got %d", removeCount)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// cleanupOrphaned 本地缓存恢复测试
+// ---------------------------------------------------------------------------
+
+// TestCleanupRecoversManifestFromLocalCache verifies that cleanupOrphaned
+// recovers a missing MANIFEST from local cache when CURRENT references it.
+func TestCleanupRecoversManifestFromLocalCache(t *testing.T) {
+	s, mock, cleanup := newTestStorage(t, func(m *mockClient) {
+		m.existsFunc = func(ctx context.Context, key string) (bool, error) {
+			if key == "CURRENT" {
+				return true, nil
+			}
+			if strings.HasPrefix(key, "MANIFEST-") {
+				return false, nil // manifest not in S3
+			}
+			return false, nil
+		}
+		m.getBytesFunc = func(ctx context.Context, key string) ([]byte, error) {
+			if key == "CURRENT" {
+				return []byte("MANIFEST-000100\n"), nil
+			}
+			return nil, os.ErrNotExist
+		}
+	})
+	defer cleanup()
+
+	manifestName := "MANIFEST-000100"
+	manifestData := []byte("manifest content from local cache")
+
+	// Write manifest to local cache
+	os.WriteFile(filepath.Join(s.localDir, manifestName), manifestData, 0644)
+
+	// cleanupOrphaned → verifyCurrentManifest → recover from local cache
+	if err := s.cleanupOrphaned(); err != nil {
+		t.Fatalf("cleanupOrphaned failed: %v", err)
+	}
+
+	// Verify MANIFEST was uploaded to S3
+	found := false
+	for _, call := range mock.putBytesCalls {
+		if call.Key == manifestName {
+			found = true
+			if string(call.Data) != string(manifestData) {
+				t.Fatalf("expected manifest data %q, got %q", string(manifestData), string(call.Data))
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected PutBytes call for " + manifestName + " from local cache recovery")
+	}
+}
+
+// TestCleanupOrphanedCurrentMissingWithLocalManifest verifies that when CURRENT
+// is missing from S3 and a MANIFEST exists in local cache, recoverFromLocalCache
+// uploads both the MANIFEST and CURRENT to restore the database.
+func TestCleanupOrphanedCurrentMissingWithLocalManifest(t *testing.T) {
+	s, mock, cleanup := newTestStorage(t, func(m *mockClient) {
+		m.existsFunc = func(ctx context.Context, key string) (bool, error) {
+			return false, nil // CURRENT doesn't exist
+		}
+		m.listFunc = func(ctx context.Context) ([]storage.FileDesc, error) {
+			return nil, nil // No files in S3
+		}
+	})
+	defer cleanup()
+
+	manifestName := "MANIFEST-000100"
+	manifestData := []byte("manifest for current-rebuild")
+
+	// Write MANIFEST to local cache (not pendingDir)
+	os.WriteFile(filepath.Join(s.localDir, manifestName), manifestData, 0644)
+
+	// cleanupOrphaned → recoverFromLocalCache → findLatestLocalManifest
+	if err := s.cleanupOrphaned(); err != nil {
+		t.Fatalf("cleanupOrphaned failed: %v", err)
+	}
+
+	// Verify both MANIFEST and CURRENT were uploaded
+	putKeys := make(map[string]bool)
+	for _, call := range mock.putBytesCalls {
+		putKeys[call.Key] = true
+	}
+	if !putKeys[manifestName] {
+		t.Fatal("expected " + manifestName + " to be uploaded from local cache recovery")
+	}
+	if !putKeys["CURRENT"] {
+		t.Fatal("expected CURRENT to be uploaded after manifest recovery from local cache")
 	}
 }

@@ -36,4 +36,9 @@ type S3ClientAPI interface {
 
 	// Copy copies an object from srcKey to dstKey within the same bucket.
 	Copy(ctx context.Context, srcKey, dstKey string) error
+
+	// ListNames returns all object keys (relative to opt.Path) with the given prefix.
+	// Returned keys include the prefix (e.g., "pending_shadow/000001.ldb").
+	// Used for listing shadow prefix files for cross-node pending recovery.
+	ListNames(ctx context.Context, prefix string) ([]string, error)
 }

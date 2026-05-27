@@ -3,14 +3,15 @@ package s3
 import "errors"
 
 var (
-	ErrLockNotFound      = errors.New("lock file not found")
-	ErrLockHeld          = errors.New("storage is locked by another process")
-	ErrLockAcquireFailed = errors.New("failed to acquire lock")
-	ErrFileTooLarge      = errors.New("file exceeds maximum allowed size")
-	ErrInvalidFile       = errors.New("invalid file descriptor")
-	ErrClosed            = errors.New("storage is closed")
-	ErrRetryExhausted    = errors.New("max retry attempts exhausted")
-	ErrLockLost          = errors.New("distributed lock lost: writes are no longer safe")
+	ErrLockNotFound         = errors.New("lock file not found")
+	ErrLockHeld             = errors.New("storage is locked by another process")
+	ErrLockAcquireFailed    = errors.New("failed to acquire lock")
+	ErrFileTooLarge         = errors.New("file exceeds maximum allowed size")
+	ErrInvalidFile          = errors.New("invalid file descriptor")
+	ErrClosed               = errors.New("storage is closed")
+	ErrRetryExhausted       = errors.New("max retry attempts exhausted")
+	ErrLockLost             = errors.New("distributed lock lost: writes are no longer safe")
+	ErrPendingChecksumMatch = errors.New("pending file checksum mismatch, data corrupted on disk")
 )
 
 type RetryableError struct {

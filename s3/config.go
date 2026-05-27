@@ -15,10 +15,14 @@ const (
 	DefaultRequestTimeout = 120 * time.Second      // 增加单次请求超时
 	DefaultLeaseDuration  = 60 * time.Second       // 增加锁的 Lease 时间
 	DefaultLeaseRenewal   = 20 * time.Second       // 增加续约间隔
-	// RetryMaxDuration 无限重试的最大持续时间，0 表示无限重试直到成功
+	// RetryMaxDuration 无线重试的最大持续时间，0 表示无限重试直到成功
 	DefaultRetryMaxDuration = 0
 	// RetryFlushInterval 后台重试的检查间隔
 	DefaultRetryFlushInterval = 5 * time.Second
+	// DefaultPendingShadowPrefix S3 shadow 前缀，用于跨节点 pending 恢复
+	DefaultPendingShadowPrefix = "pending_shadow"
+	// DefaultPendingMaxConcurrency 后台重试时并行上传的 goroutine 数量
+	DefaultPendingMaxConcurrency = 4
 )
 
 type OpenOption struct {
@@ -45,6 +49,18 @@ type OpenOption struct {
 	RetryMaxDuration time.Duration
 	// RetryFlushInterval 后台重试的检查间隔
 	RetryFlushInterval time.Duration
+	// PendingShadowPrefix S3 shadow 前缀，用于跨节点 pending 恢复。
+	// 当 S3 上传失败写入本地 pending 时，同时 best-effort 上传到 S3 的该前缀下。
+	// 另一个节点获取锁后从该前缀下载缺失的 pending 文件，实现跨节点数据恢复。
+	// 设为 "" 禁用 shadow 备份。
+	PendingShadowPrefix string
+	// PendingMaxConcurrency 后台重试时并行上传 pending 文件的 goroutine 数量
+	PendingMaxConcurrency int
+	// MaxPendingSize 本地 pending 目录最大字节数，超过时触发 OnPendingWarning 回调。
+	// 0 表示无限制。
+	MaxPendingSize int64
+	// OnPendingWarning pending 文件积压告警回调，当 pending 文件总大小超过 MaxPendingSize 时调用。
+	OnPendingWarning func(pendingCount int, pendingSize int64)
 }
 
 func (opt *OpenOption) ApplyDefaults() {
@@ -79,6 +95,12 @@ func (opt *OpenOption) ApplyDefaults() {
 	}
 	if opt.RetryFlushInterval <= 0 {
 		opt.RetryFlushInterval = DefaultRetryFlushInterval
+	}
+	if opt.PendingShadowPrefix == "" {
+		opt.PendingShadowPrefix = DefaultPendingShadowPrefix
+	}
+	if opt.PendingMaxConcurrency <= 0 {
+		opt.PendingMaxConcurrency = DefaultPendingMaxConcurrency
 	}
 }
 

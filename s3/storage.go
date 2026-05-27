@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -122,6 +124,7 @@ type S3Storage struct {
 	retryWg     sync.WaitGroup
 	lockLost    atomic.Bool // 锁丢失标记，设置后禁止写入
 	lockHeld    atomic.Bool // 是否持有分布式锁，后台重试前检查
+	shadowPrefix string       // S3 shadow 前缀，用于跨节点 pending 恢复
 }
 
 func NewS3Storage(client S3ClientAPI, s3Lock *S3Lock, opt OpenOption) (*S3Storage, error) {
@@ -155,16 +158,22 @@ func NewS3Storage(client S3ClientAPI, s3Lock *S3Lock, opt OpenOption) (*S3Storag
 		}
 	}
 
+	shadowPrefix := ""
+	if opt.PendingShadowPrefix != "" {
+		shadowPrefix = opt.PendingShadowPrefix
+	}
+
 	ss := &S3Storage{
-		client:      client,
-		s3Lock:      s3Lock,
-		opt:         opt,
-		ctx:         ctx,
-		cancel:      cancel,
-		cache:       cache,
-		localDir:    localDir,
-		pendingDir:  pendingDir,
-		retryStopCh: make(chan struct{}),
+		client:       client,
+		s3Lock:       s3Lock,
+		opt:          opt,
+		ctx:          ctx,
+		cancel:       cancel,
+		cache:        cache,
+		localDir:     localDir,
+		pendingDir:   pendingDir,
+		retryStopCh:  make(chan struct{}),
+		shadowPrefix: shadowPrefix,
 	}
 
 	// 启动后台重试 goroutine，无限重试直到成功
@@ -340,13 +349,13 @@ func (s *S3Storage) List(ft storage.FileType) ([]storage.FileDesc, error) {
 		return nil, fmt.Errorf("failed to list files: %w", err)
 	}
 
-	// 同时收集 pending 目录中的文件
+	// 同时收集 pending 目录中的文件（过滤校验和文件）
 	var pendingFiles []storage.FileDesc
 	if s.pendingDir != "" {
 		entries, readErr := os.ReadDir(s.pendingDir)
 		if readErr == nil {
 			for _, entry := range entries {
-				if !entry.IsDir() {
+				if !entry.IsDir() && !strings.HasSuffix(entry.Name(), ".cksum") {
 					if fd, ok := parseFileDesc(entry.Name()); ok {
 						pendingFiles = append(pendingFiles, fd)
 					}
@@ -493,13 +502,17 @@ func (s *S3Storage) uploadFile(fd storage.FileDesc, data []byte) error {
 		return fmt.Errorf("failed to upload file %s: %w", name, err)
 	}
 
-	// 上传成功，清理 pending 目录中可能存在的旧文件
+	// 上传成功，清理 pending 目录中可能存在的旧文件及校验和
 	if s.pendingDir != "" {
 		pendingPath := filepath.Join(s.pendingDir, name)
 		if rmErr := os.Remove(pendingPath); rmErr == nil {
 			s.Log(fmt.Sprintf("uploadFile: 清理 pending 目录中的旧文件: %s", name))
 		}
+		os.Remove(pendingPath + ".cksum")
 	}
+
+	// 清理 shadow 备份
+	s.cleanShadow(name)
 
 	cacheKey := s.makeCacheKey(fd)
 	s.cache.Add(cacheKey, &memFile{fd: fd, data: data})
@@ -508,7 +521,9 @@ func (s *S3Storage) uploadFile(fd storage.FileDesc, data []byte) error {
 	return nil
 }
 
-// persistToLocal 将数据写入本地 pending 目录，确保上传失败时数据不丢失
+// persistToLocal 将数据写入本地 pending 目录并附带校验和，
+// 同时 best-effort 同步到 S3 shadow 前缀（用于跨节点恢复）。
+// 确保上传失败时数据不丢失。
 func (s *S3Storage) persistToLocal(fd storage.FileDesc, data []byte) error {
 	if s.pendingDir == "" {
 		return errors.New("pending directory not configured")
@@ -527,8 +542,208 @@ func (s *S3Storage) persistToLocal(fd storage.FileDesc, data []byte) error {
 		return fmt.Errorf("failed to write local file: %w", err)
 	}
 
+	// 写入校验和文件，用于检测磁盘静默损坏
+	cksum := fmt.Sprintf("%08x", crc32.ChecksumIEEE(data))
+	if cksumErr := os.WriteFile(localPath+".cksum", []byte(cksum), 0644); cksumErr != nil {
+		s.Log(fmt.Sprintf("persistToLocal: 写入 checksum 失败: %s (%v)", name, cksumErr))
+	}
+
+	// Best-effort 同步到 S3 shadow 前缀，供跨节点崩溃恢复使用
+	s.uploadToShadow(name, data)
+
 	s.Log(fmt.Sprintf("persistToLocal OK: %s (%d bytes) -> %s", name, len(data), localPath))
 	return nil
+}
+
+// uploadToShadow best-effort 上传文件到 S3 shadow 前缀，
+// 用于跨节点崩溃恢复。另一个节点获取锁后可从 shadow 前缀恢复 pending 文件。
+func (s *S3Storage) uploadToShadow(name string, data []byte) {
+	if s.shadowPrefix == "" {
+		return
+	}
+	key := s.shadowPrefix + "/" + name
+	if err := s.client.PutBytes(s.ctx, key, data); err != nil {
+		s.Log(fmt.Sprintf("uploadToShadow: shadow 备份失败: %s (%v)", name, err))
+	}
+}
+
+// cleanShadow 从 S3 shadow 前缀删除文件
+func (s *S3Storage) cleanShadow(name string) {
+	if s.shadowPrefix == "" {
+		return
+	}
+	key := s.shadowPrefix + "/" + name
+	if err := s.client.Remove(s.ctx, key); err != nil {
+		s.Log(fmt.Sprintf("cleanShadow: 删除 shadow 失败: %s (%v)", name, err))
+	}
+}
+
+// syncFromShadow 从 S3 shadow 前缀下载本节点缺失的 pending 文件。
+// 当旧节点崩溃时，它的 pending 文件可能通过 shadow 机制存在于 S3 中，
+// 新节点获取锁后调用此函数将这些文件恢复到本地 pending 目录。
+func (s *S3Storage) syncFromShadow() error {
+	if s.shadowPrefix == "" || s.pendingDir == "" {
+		return nil
+	}
+
+	keys, err := s.client.ListNames(s.ctx, s.shadowPrefix+"/")
+	if err != nil {
+		return fmt.Errorf("failed to list shadow prefix: %w", err)
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+
+	s.Log(fmt.Sprintf("syncFromShadow: 发现 %d 个 shadow 文件", len(keys)))
+
+	for _, key := range keys {
+		// key 格式: "pending_shadow/000001.ldb"
+		name := strings.TrimPrefix(key, s.shadowPrefix+"/")
+		if name == "" {
+			continue
+		}
+
+		// 如果本地已有该文件，跳过（本地 pending 是权威来源）
+		localPath := filepath.Join(s.pendingDir, name)
+		if _, statErr := os.Stat(localPath); statErr == nil {
+			continue
+		}
+
+		data, getErr := s.client.GetBytes(s.ctx, key)
+		if getErr != nil {
+			s.Log(fmt.Sprintf("syncFromShadow: 下载失败: %s (%v)", key, getErr))
+			continue
+		}
+
+		if writeErr := atomicWriteFile(localPath, data, 0644); writeErr != nil {
+			s.Log(fmt.Sprintf("syncFromShadow: 写入本地 pending 失败: %s (%v)", name, writeErr))
+			continue
+		}
+
+		// 写入校验和
+		cksum := fmt.Sprintf("%08x", crc32.ChecksumIEEE(data))
+		os.WriteFile(localPath+".cksum", []byte(cksum), 0644)
+
+		s.Log(fmt.Sprintf("syncFromShadow: 从 shadow 恢复: %s (%d bytes)", name, len(data)))
+	}
+	return nil
+}
+
+// pendingFileEntry 表示 pending 目录中的一个待上传文件
+type pendingFileEntry struct {
+	name     string
+	data     []byte
+	fd       storage.FileDesc
+	localPath string
+}
+
+// pendingFilePriority 返回文件的上传优先级（数字越小越优先）
+func pendingFilePriority(fd storage.FileDesc) int {
+	switch fd.Type {
+	case storage.TypeTable:
+		return 0 // SSTable 数据文件最优先（其他文件依赖它）
+	case storage.TypeJournal:
+		return 1
+	case storage.TypeManifest:
+		return 2 // MANIFEST 在数据文件之后上传
+	default:
+		return 99
+	}
+}
+
+// readPendingFiles 读取 pending 目录中所有文件，校验校验和，
+// 按上传优先级排序后返回。
+func (s *S3Storage) readPendingFiles() ([]pendingFileEntry, error) {
+	if s.pendingDir == "" {
+		return nil, nil
+	}
+
+	entries, err := os.ReadDir(s.pendingDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var files []pendingFileEntry
+
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasSuffix(entry.Name(), ".cksum") {
+			continue
+		}
+
+		name := entry.Name()
+		localPath := filepath.Join(s.pendingDir, name)
+
+		data, readErr := os.ReadFile(localPath)
+		if readErr != nil {
+			s.Log(fmt.Sprintf("readPendingFiles: 读取失败: %s (%v)", name, readErr))
+			continue
+		}
+
+		fd, ok := parseFileDesc(name)
+		if !ok {
+			s.Log(fmt.Sprintf("readPendingFiles: 无法解析文件名: %s", name))
+			continue
+		}
+
+		// 校验校验和（.cksum 文件不存在时跳过校验，兼容旧版本）
+		if cksumData, cksumErr := os.ReadFile(localPath + ".cksum"); cksumErr == nil {
+			expected := strings.TrimSpace(string(cksumData))
+			actual := fmt.Sprintf("%08x", crc32.ChecksumIEEE(data))
+			if expected != actual {
+				s.Log(fmt.Sprintf("readPendingFiles: 校验和不匹配: %s (期望=%s, 实际=%s)，删除损坏文件", name, expected, actual))
+				os.Remove(localPath)
+				os.Remove(localPath + ".cksum")
+				continue
+			}
+		}
+
+		files = append(files, pendingFileEntry{
+			name:      name,
+			data:      data,
+			fd:        fd,
+			localPath: localPath,
+		})
+	}
+
+	// 按上传优先级排序：SSTable → Journal → MANIFEST → 其他
+	sort.Slice(files, func(i, j int) bool {
+		return pendingFilePriority(files[i].fd) < pendingFilePriority(files[j].fd)
+	})
+
+	return files, nil
+}
+
+// checkPendingPressure 检查 pending 目录大小是否超过限制，超过时触发告警回调
+func (s *S3Storage) checkPendingPressure() {
+	if s.opt.MaxPendingSize <= 0 || s.opt.OnPendingWarning == nil || s.pendingDir == "" {
+		return
+	}
+
+	var totalSize int64
+	var fileCount int
+
+	entries, err := os.ReadDir(s.pendingDir)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasSuffix(entry.Name(), ".cksum") {
+			continue
+		}
+		info, statErr := entry.Info()
+		if statErr == nil {
+			totalSize += info.Size()
+		}
+		fileCount++
+	}
+
+	if totalSize > s.opt.MaxPendingSize {
+		s.opt.OnPendingWarning(fileCount, totalSize)
+	}
 }
 
 // RetryPendingUploads 重试 pending 目录中积压的上传任务
@@ -603,7 +818,7 @@ func (s *S3Storage) HasPendingUploads() bool {
 	}
 
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() && !strings.HasSuffix(entry.Name(), ".cksum") {
 			return true
 		}
 	}
@@ -631,14 +846,17 @@ func (s *S3Storage) Remove(fd storage.FileDesc) error {
 		os.Remove(localPath)
 	}
 
-	// 同时删除 pending 目录中的文件，避免后台继续上传已删除的文件
+	// 同时删除 pending 目录中的文件及校验和，避免后台继续上传已删除的文件
 	if s.pendingDir != "" {
 		pendingPath := filepath.Join(s.pendingDir, name)
-		rmErr := os.Remove(pendingPath)
-		if rmErr == nil {
+		if rmErr := os.Remove(pendingPath); rmErr == nil {
 			s.Log(fmt.Sprintf("Remove: 同时删除 pending 目录中的文件: %s", name))
 		}
+		os.Remove(pendingPath + ".cksum")
 	}
+
+	// 清理 shadow 备份
+	s.cleanShadow(name)
 
 	if err := s.client.Remove(s.ctx, name); err != nil {
 		return fmt.Errorf("failed to remove file %s: %w", name, err)
@@ -686,6 +904,13 @@ func (s *S3Storage) Rename(oldfd, newfd storage.FileDesc) error {
 		if _, statErr := os.Stat(oldPendingPath); statErr == nil {
 			// 旧文件存在，重命名为新文件名
 			if renameErr := os.Rename(oldPendingPath, newPendingPath); renameErr == nil {
+				// 同时重命名校验和文件
+				os.Rename(oldPendingPath+".cksum", newPendingPath+".cksum")
+				// 更新 shadow：删除旧 shadow，上传新 shadow
+				s.cleanShadow(oldName)
+				if data, readErr := os.ReadFile(newPendingPath); readErr == nil {
+					s.uploadToShadow(newName, data)
+				}
 				s.Log(fmt.Sprintf("Rename: 同时重命名 pending 目录中的文件: %s -> %s", oldName, newName))
 			} else {
 				s.Log(fmt.Sprintf("Rename: 重命名 pending 目录文件失败: %s (%v)", oldName, renameErr))
@@ -693,6 +918,12 @@ func (s *S3Storage) Rename(oldfd, newfd storage.FileDesc) error {
 				if data, readErr := os.ReadFile(oldPendingPath); readErr == nil {
 					if writeErr := os.WriteFile(newPendingPath, data, 0644); writeErr == nil {
 						os.Remove(oldPendingPath)
+						os.Remove(oldPendingPath + ".cksum")
+						// 写入新校验和
+						cksum := fmt.Sprintf("%08x", crc32.ChecksumIEEE(data))
+						os.WriteFile(newPendingPath+".cksum", []byte(cksum), 0644)
+						s.cleanShadow(oldName)
+						s.uploadToShadow(newName, data)
 						s.Log(fmt.Sprintf("Rename: 通过读写方式重命名 pending 目录文件成功: %s -> %s", oldName, newName))
 					}
 				}
@@ -745,16 +976,18 @@ func (s *S3Storage) backgroundRetryLoop() {
 		case <-s.retryStopCh:
 			s.Log("backgroundRetryLoop: 收到停止信号，正在等待当前重试完成...")
 			// 再做一次最终重试，确保所有文件都被尝试
+			s.checkPendingPressure()
 			s.retryPendingFilesOnce()
 			s.Log("backgroundRetryLoop: 已停止")
 			return
 		case <-ticker.C:
+			s.checkPendingPressure()
 			s.retryPendingFilesOnce()
 		}
 	}
 }
 
-// retryPendingFilesOnce 单次尝试重试所有 pending 文件
+// retryPendingFilesOnce 单次尝试重试所有 pending 文件，按优先级排序，并行上传
 func (s *S3Storage) retryPendingFilesOnce() {
 	if s.pendingDir == "" {
 		return
@@ -770,58 +1003,56 @@ func (s *S3Storage) retryPendingFilesOnce() {
 		return
 	}
 
-	entries, err := os.ReadDir(s.pendingDir)
+	files, err := s.readPendingFiles()
 	if err != nil {
-		if !os.IsNotExist(err) {
-			s.Log(fmt.Sprintf("retryPendingFilesOnce: 读取pending目录失败: %v", err))
-		}
+		s.Log(fmt.Sprintf("retryPendingFilesOnce: 读取 pending 目录失败: %v", err))
+		return
+	}
+	if len(files) == 0 {
 		return
 	}
 
-	if len(entries) == 0 {
-		return
+	s.Log(fmt.Sprintf("retryPendingFilesOnce: 发现 %d 个待上传文件（已排序）", len(files)))
+
+	// 并发上传，按顺序限制 goroutine 数量
+	concurrency := s.opt.PendingMaxConcurrency
+	if concurrency <= 0 {
+		concurrency = DefaultPendingMaxConcurrency
 	}
 
-	s.Log(fmt.Sprintf("retryPendingFilesOnce: 发现 %d 个待上传文件", len(entries)))
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
 
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
+	for _, file := range files {
+		wg.Add(1)
+		sem <- struct{}{}
+		f := file // capture
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
 
-		name := entry.Name()
-		localPath := filepath.Join(s.pendingDir, name)
+			s.Log(fmt.Sprintf("retryPendingFilesOnce: 尝试上传: %s (%d bytes)", f.name, len(f.data)))
 
-		data, readErr := os.ReadFile(localPath)
-		if readErr != nil {
-			s.Log(fmt.Sprintf("retryPendingFilesOnce: 读取本地文件失败: %s (%v)", name, readErr))
-			continue
-		}
+			uploadErr := s.uploadWithInfiniteRetry(f.fd, f.data)
+			if uploadErr != nil {
+				s.Log(fmt.Sprintf("retryPendingFilesOnce: 上传失败（已达最大重试时间）: %s (%v)", f.name, uploadErr))
+				return
+			}
 
-		fd, ok := parseFileDesc(name)
-		if !ok {
-			s.Log(fmt.Sprintf("retryPendingFilesOnce: 无法解析文件名: %s", name))
-			continue
-		}
+			// 上传成功，删除本地文件和校验和
+			if rmErr := os.Remove(f.localPath); rmErr != nil {
+				s.Log(fmt.Sprintf("retryPendingFilesOnce: 删除本地文件失败: %s (%v)", f.name, rmErr))
+			}
+			os.Remove(f.localPath + ".cksum")
 
-		s.Log(fmt.Sprintf("retryPendingFilesOnce: 尝试上传: %s (%d bytes)", name, len(data)))
+			// 清理 shadow
+			s.cleanShadow(f.name)
 
-		// 带重试的 PutBytes
-		uploadErr := s.uploadWithInfiniteRetry(fd, data)
-		if uploadErr != nil {
-			s.Log(fmt.Sprintf("retryPendingFilesOnce: 上传失败（已达最大重试时间）: %s (%v)", name, uploadErr))
-			continue
-		}
-
-		// 上传成功，删除本地文件
-		if rmErr := os.Remove(localPath); rmErr != nil {
-			s.Log(fmt.Sprintf("retryPendingFilesOnce: 删除本地文件失败: %s (%v)", name, rmErr))
-		} else {
-			s.Log(fmt.Sprintf("retryPendingFilesOnce: 上传成功并删除本地文件: %s", name))
-		}
+			s.Log(fmt.Sprintf("retryPendingFilesOnce: 上传成功并删除本地文件: %s", f.name))
+		}()
 	}
+	wg.Wait()
 }
-
 // uploadWithInfiniteRetry 无限重试直到成功
 // 如果配置了 RetryMaxDuration，则在超过该时间后返回错误
 func (s *S3Storage) uploadWithInfiniteRetry(fd storage.FileDesc, data []byte) error {
@@ -983,68 +1214,81 @@ func (s *S3Storage) syncPendingToS3() error {
 		return nil
 	}
 
-	entries, err := os.ReadDir(s.pendingDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("failed to read pending dir: %w", err)
+	// 先从 S3 shadow 前缀恢复跨节点 pending 文件
+	if err := s.syncFromShadow(); err != nil {
+		s.Log(fmt.Sprintf("syncPendingToS3: syncFromShadow had errors: %v", err))
 	}
 
-	if len(entries) == 0 {
+	// 读取本地 pending 文件（校验和验证 + 优先级排序）
+	files, err := s.readPendingFiles()
+	if err != nil {
+		return fmt.Errorf("failed to read pending dir: %w", err)
+	}
+	if len(files) == 0 {
 		return nil
 	}
 
-	s.Log(fmt.Sprintf("syncPendingToS3: found %d pending files to recover", len(entries)))
-	var firstErr error
+	s.Log(fmt.Sprintf("syncPendingToS3: found %d pending files to recover", len(files)))
 
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-
-		name := entry.Name()
-		localPath := filepath.Join(s.pendingDir, name)
-
-		data, readErr := os.ReadFile(localPath)
-		if readErr != nil {
-			s.Log(fmt.Sprintf("syncPendingToS3: failed to read %s: %v", name, readErr))
-			continue
-		}
-
-		fd, ok := parseFileDesc(name)
-		if !ok {
-			s.Log(fmt.Sprintf("syncPendingToS3: unrecognized filename %s, removing", name))
-			os.Remove(localPath)
-			continue
-		}
-
-		s.Log(fmt.Sprintf("syncPendingToS3: recovering %s (%d bytes)", name, len(data)))
-		if err := s.client.PutBytes(s.ctx, name, data); err != nil {
-			s.Log(fmt.Sprintf("syncPendingToS3: FAILED to upload %s: %v (keeping in pendingDir)", name, err))
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue // best-effort: keep trying other files
-		}
-
-		// Upload successful -- remove from pendingDir
-		if rmErr := os.Remove(localPath); rmErr != nil {
-			s.Log(fmt.Sprintf("syncPendingToS3: uploaded %s but failed to remove local copy: %v", name, rmErr))
-		} else {
-			s.Log(fmt.Sprintf("syncPendingToS3: successfully recovered %s", name))
-		}
-
-		// Update in-memory cache
-		cacheKey := s.makeCacheKey(fd)
-		if len(data) <= int(s.opt.MaxFileSize) {
-			s.cache.Add(cacheKey, &memFile{fd: fd, data: data})
-		}
+	// 并发上传（best-effort，不阻塞整体恢复）
+	concurrency := s.opt.PendingMaxConcurrency
+	if concurrency <= 0 {
+		concurrency = DefaultPendingMaxConcurrency
 	}
 
+	type result struct {
+		name string
+		err  error
+	}
+	resultCh := make(chan result, len(files))
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+
+	for _, file := range files {
+		wg.Add(1)
+		sem <- struct{}{}
+		f := file
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			s.Log(fmt.Sprintf("syncPendingToS3: recovering %s (%d bytes)", f.name, len(f.data)))
+			if putErr := s.client.PutBytes(s.ctx, f.name, f.data); putErr != nil {
+				s.Log(fmt.Sprintf("syncPendingToS3: FAILED to upload %s: %v (keeping in pendingDir)", f.name, putErr))
+				resultCh <- result{name: f.name, err: putErr}
+				return
+			}
+
+			// Upload successful -- remove from pendingDir
+			if rmErr := os.Remove(f.localPath); rmErr != nil {
+				s.Log(fmt.Sprintf("syncPendingToS3: uploaded %s but failed to remove local copy: %v", f.name, rmErr))
+			}
+			os.Remove(f.localPath + ".cksum")
+
+			// 清理 shadow
+			s.cleanShadow(f.name)
+
+			// Update in-memory cache
+			cacheKey := s.makeCacheKey(f.fd)
+			if len(f.data) <= int(s.opt.MaxFileSize) {
+				s.cache.Add(cacheKey, &memFile{fd: f.fd, data: f.data})
+			}
+
+			s.Log(fmt.Sprintf("syncPendingToS3: successfully recovered %s", f.name))
+			resultCh <- result{name: f.name, err: nil}
+		}()
+	}
+	wg.Wait()
+	close(resultCh)
+
+	var firstErr error
+	for r := range resultCh {
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
+		}
+	}
 	return firstErr
 }
-
 // cleanupOrphaned checks for inconsistent state in S3 and tries to recover.
 // This handles the case where a previous session was interrupted (e.g., by Ctrl+C)
 // and goleveldb's newManifest() had already:
@@ -1124,6 +1368,7 @@ func (s *S3Storage) verifyCurrentManifest() error {
 			} else {
 				s.Log(fmt.Sprintf("cleanup: successfully recovered %s from pendingDir", fd.String()))
 				os.Remove(pendingPath)
+				os.Remove(pendingPath + ".cksum")
 				return nil
 			}
 		}
@@ -1192,6 +1437,7 @@ func (s *S3Storage) recoverFromLocalCache() error {
 
 			s.Log(fmt.Sprintf("cleanup: successfully recovered database from pendingDir (CURRENT &rarr; %s)", manifestFd.String()))
 			os.Remove(filepath.Join(s.pendingDir, manifestFd.String()))
+			os.Remove(filepath.Join(s.pendingDir, manifestFd.String()) + ".cksum")
 			return nil
 		}
 	}
@@ -1255,7 +1501,7 @@ func (s *S3Storage) findLatestPendingManifest() (fd *storage.FileDesc, data []by
 	var bestNum int64
 	var bestName string
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if entry.IsDir() || strings.HasSuffix(entry.Name(), ".cksum") {
 			continue
 		}
 		name := entry.Name()
